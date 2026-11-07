@@ -16,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -35,14 +35,21 @@ INSTRUCTIONS = """\
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
+- 確認問題やクイズを求められたら make_quiz を使い、答えは利用者が回答するまで見せない。
+- 学習の記録を保存してと頼まれたときだけ save_learning_log を使う。
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+# 第3回 宿題（実装）: 承認待ちのツールがあると、結果として DeferredToolRequests が返るので output_type に加える
+agent = Agent(instructions=INSTRUCTIONS, output_type=[str, DeferredToolRequests])
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
 
-# TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+# 第3回 演習: 確認問題を作るツール
+agent.tool_plain(tools.make_quiz)
+
+# 第3回 宿題（実装）: ファイルへの保存は取り消しにくいので、実行の前に利用者の承認を挟む
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -109,6 +116,39 @@ def print_trace(result) -> None:
     print(f"[usage] {result.usage}")
 
 
+def ask_approvals(requests: DeferredToolRequests, ask=input) -> DeferredToolResults:
+    """第3回 宿題（実装）: 承認待ちのツール呼び出しを1つずつ利用者に見せ、実行してよいかを聞く。
+
+    y で承認、それ以外は拒否（ToolDenied）。拒否の理由はモデルに伝わり、モデルはそれを踏まえて回答する。
+    ask は入力を受け取る関数（テストで差し替えられるように引数にしている）。
+    """
+    results = DeferredToolResults()
+    for call in requests.approvals:
+        args = call.args_as_dict()
+        print(f"\n[承認待ち] {call.tool_name}")
+        for key, value in args.items():
+            print(f"  {key}: {value}")
+        answer = ask("このツールを実行してよいですか？ [y/N]: ").strip().lower()
+        if answer in ("y", "yes"):
+            results.approvals[call.tool_call_id] = True
+        else:
+            results.approvals[call.tool_call_id] = ToolDenied("利用者が実行を断りました。保存はしていません。")
+    return results
+
+
+def run_with_approval(target: Agent, question: str, model, ask=input):
+    """質問を実行し、承認待ちで止まったら利用者に聞いて、続きを実行する（承認が続く限りくり返す）。"""
+    result = target.run_sync(question, model=model)
+    while isinstance(result.output, DeferredToolRequests):
+        decisions = ask_approvals(result.output, ask=ask)
+        result = target.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=decisions,
+            model=model,
+        )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="学習支援エージェントに質問する")
     parser.add_argument("question", nargs="?")
@@ -128,7 +168,7 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = run_with_approval(target, args.question, build_model())
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
