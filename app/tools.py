@@ -5,10 +5,15 @@
 """
 
 import json
+import random
+import re
+from datetime import datetime
 from functools import cache
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# 第3回 宿題（実装）: 学習の記録の保存先。.gitignore で共有しないようにしてある
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
 MAX_RESULTS = 3
 
 
@@ -77,3 +82,52 @@ def get_lecture_summary(lecture: int) -> str:
         available = sorted(p.stem for p in (DATA_DIR / "lectures").glob("*.md"))
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
+
+
+def make_quiz(lecture: int) -> str:
+    """指定した回（1始まりの整数）の用語から確認問題を1問作り、問題と答えを返す。
+
+    「第2回の確認問題を出して」「第3回の復習クイズがほしい」のように、
+    確認問題・クイズ・復習の問題を求められたときに使う。lecture には回の番号を入れる。
+    返り値の answer は、利用者が答えるまで見せないこと。
+    """
+    candidates = [e for e in load_glossary() if e["lecture"] == lecture]
+    if not candidates:
+        available = sorted({e["lecture"] for e in load_glossary()})
+        return f"第{lecture}回の用語は用語集にありません。問題を作れる回: {', '.join(map(str, available))}"
+    entry = random.choice(candidates)
+    return json.dumps(
+        {"question": f"「{entry['term']}」の意味は？", "answer": entry["definition"], "lecture": lecture},
+        ensure_ascii=False,
+    )
+
+
+def _safe_filename(title: str) -> str:
+    """ファイル名に使えない文字を「_」に置き換え、長すぎる題名は切る。"""
+    name = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("._")
+    return name[:40] or "記録"
+
+
+def save_learning_log(title: str, content: str) -> str:
+    """学習の記録を、Markdown ファイルとして learning_log/ フォルダに保存する。
+
+    「今日学んだことを保存して」「この内容を学習ログに残して」のように、
+    利用者が記録の保存をはっきり頼んだときだけ使う。頼まれていないのに保存しない。
+    title には記録の短い題名（例: "LoRAとQLoRAの違い"）、
+    content には保存する本文（Markdown）を入れる。
+    保存してよいかの確認はこのツールを呼んだあとにプログラムが利用者へ行うので、
+    チャットで確認を取り直さず、頼まれたらそのまま呼ぶこと。
+    """
+    if not title.strip() or not content.strip():
+        return "題名か本文が空なので保存しませんでした。"
+    LOG_DIR.mkdir(exist_ok=True)
+    now = datetime.now()
+    stem = f"{now:%Y-%m-%d_%H%M%S}_{_safe_filename(title)}"
+    path = LOG_DIR / f"{stem}.md"
+    n = 2
+    while path.exists():  # 同じ秒に同じ題名で保存しても上書きしない
+        path = LOG_DIR / f"{stem}-{n}.md"
+        n += 1
+    text = f"# {title}\n\n保存日時: {now:%Y-%m-%d %H:%M}\n\n{content}\n"
+    path.write_text(text, encoding="utf-8")
+    return f"保存しました: learning_log/{path.name}"
